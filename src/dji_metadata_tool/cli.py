@@ -1,10 +1,15 @@
 import json
+import math
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 
 import pandas as pd
+import pyproj
 import typer
 from rich import print
+from shapely.geometry import box, mapping
+from shapely.ops import transform
+from shapely import wkt as shapely_wkt
 
 from dji_metadata_tool.dji_wpml import parse_kmz
 
@@ -235,6 +240,134 @@ def user_metadata(
         f"\n[bold]Summary:[/bold] "
         f"{counts['written']} written, "
         f"{counts['skipped']} skipped, "
+        f"{counts['warning']} warnings"
+    )
+
+
+def _compute_chips_geojson(survey_uid: str, polygon_wkt: str, utm_crs_str: str, chip_size: int) -> dict:
+    wgs84 = pyproj.CRS("EPSG:4326")
+    utm_crs = pyproj.CRS(utm_crs_str)
+    to_utm = pyproj.Transformer.from_crs(wgs84, utm_crs, always_xy=True).transform
+    to_wgs84 = pyproj.Transformer.from_crs(utm_crs, wgs84, always_xy=True).transform
+
+    poly_utm = transform(to_utm, shapely_wkt.loads(polygon_wkt))
+    xmin, ymin, xmax, ymax = poly_utm.bounds
+
+    gx0 = math.floor(xmin / chip_size) * chip_size
+    gy0 = math.floor(ymin / chip_size) * chip_size
+    gx1 = math.ceil(xmax / chip_size) * chip_size
+    gy1 = math.ceil(ymax / chip_size) * chip_size
+
+    n_cols = round((gx1 - gx0) / chip_size)
+    n_rows = round((gy1 - gy0) / chip_size)
+
+    features = []
+    chip_num = 1
+    for row in range(n_rows):
+        for col in range(n_cols):
+            cx0 = gx0 + col * chip_size
+            cx1 = cx0 + chip_size
+            cy1 = gy1 - row * chip_size
+            cy0 = cy1 - chip_size
+            chip_utm = box(cx0, cy0, cx1, cy1)
+            if not poly_utm.contains(chip_utm):
+                continue
+            chip_wgs84 = transform(to_wgs84, chip_utm)
+            features.append({
+                "type": "Feature",
+                "geometry": mapping(chip_wgs84),
+                "properties": {
+                    "chip_num": chip_num,
+                    "survey_uid": survey_uid,
+                    "utm_crs": utm_crs_str,
+                    "bounds": [cx0, cy0, cx1, cy1],
+                },
+            })
+            chip_num += 1
+
+    grid_wgs84 = transform(to_wgs84, box(gx0, gy0, gx1, gy1))
+    return {
+        "type": "FeatureCollection",
+        "bbox": list(grid_wgs84.bounds),
+        "survey_uid": survey_uid,
+        "utm_crs": utm_crs_str,
+        "grid_size": [n_rows, n_cols],
+        "features": features,
+    }
+
+
+def _process_chips(survey_uid: str, metadata_dir: Path, chip_size: int, warn_only: bool = False) -> str:
+    """Generate the chip GeoJSON for a single survey. Returns 'written' or 'warning'."""
+    survey_json = metadata_dir / f"{survey_uid}.json"
+    if not survey_json.exists():
+        if warn_only:
+            print(f"[yellow]Warning: {survey_json.name} not found in {metadata_dir}, skipping.[/yellow]")
+            return "warning"
+        print(f"[red]Error: {survey_json} not found[/red]")
+        raise typer.Exit(1)
+
+    output_file = metadata_dir / f"{survey_uid}_{chip_size}m_chips.json"
+
+    data = json.loads(survey_json.read_text())
+    props = data.get("properties", {})
+    utm_crs = props.get("utm_crs")
+    polygon_wkt = props.get("polygon_with_buffer")
+
+    if not utm_crs or not polygon_wkt:
+        if warn_only:
+            print(f"[yellow]Warning: {survey_uid} metadata missing utm_crs or polygon_with_buffer, skipping.[/yellow]")
+            return "warning"
+        print(f"[red]Error: {survey_uid} metadata missing utm_crs or polygon_with_buffer[/red]")
+        raise typer.Exit(1)
+
+    geojson = _compute_chips_geojson(survey_uid, polygon_wkt, utm_crs, chip_size)
+    output_file.write_text(json.dumps(geojson, indent=4))
+    print(f"Written {output_file.name} ({len(geojson['features'])} chips)")
+    return "written"
+
+
+@app.command("define-chips")
+def define_chips(
+    survey: Annotated[
+        Optional[str],
+        typer.Option("--survey", help="Survey UID in SITE_DATE_TAG format. Omit to run for all surveys."),
+    ] = None,
+    chip_size: Annotated[
+        int,
+        typer.Option("--chip-size", help="Chip size in metres"),
+    ] = 50,
+) -> None:
+    """Generate a fixed-grid chip GeoJSON index for one or all NatureScan surveys."""
+    title()
+
+    if survey is not None:
+        site, date, tag = parse_survey_uid(survey)
+        metadata_dir = NATURESCAN_DRONE_DIR / site / date / f"survey_{tag}" / "metadata"
+        if not metadata_dir.is_dir():
+            print(f"[red]Error: metadata directory does not exist: {metadata_dir}[/red]")
+            raise typer.Exit(1)
+        _process_chips(survey, metadata_dir, chip_size, warn_only=False)
+        return
+
+    counts = {"written": 0, "warning": 0}
+    survey_dirs = sorted(NATURESCAN_DRONE_DIR.glob("*/*/survey_*"))
+    for survey_dir in survey_dirs:
+        if not survey_dir.is_dir():
+            continue
+        site = survey_dir.parent.parent.name
+        date = survey_dir.parent.name
+        tag = survey_dir.name[len("survey_"):]
+        uid = f"{site}_{date}_{tag}"
+        metadata_dir = survey_dir / "metadata"
+        if not metadata_dir.is_dir():
+            continue
+        print(f"\n[bold]Processing {uid}[/bold]")
+        result = _process_chips(uid, metadata_dir, chip_size, warn_only=True)
+        counts[result] += 1
+
+    print(
+        f"\n[bold]Summary:[/bold] "
+        f"{counts['written']} written, "
         f"{counts['warning']} warnings"
     )
 
