@@ -1,8 +1,12 @@
+> [!CAUTION]
+> This has been archived. Use the [NatureScan CLI](https://github.com/UTAS-TerraLuma/naturescan-cli) instead.
+
 # DJI Metadata Tool
 
 A Python tool for extracting and managing metadata from DJI WPML (Waypoint Mission Language) KMZ files. Parses flight mission parameters from DJI drone mission files and writes user-provided metadata to each survey's metadata folder.
 
 ## TODO
+
 - [ ] Add tests
 
 ## Requirements
@@ -49,6 +53,7 @@ pixi run metadata-tool survey <SITE_DATE_TAG>
 The survey UID must follow the `SITE_DATE_TAG` format, e.g. `NTAFIN_20240925_m3m`.
 
 The tool looks for the KMZ in:
+
 ```
 NatureScan_drone / SITE / DATE / survey_TAG / metadata /
 ```
@@ -83,6 +88,7 @@ pixi run metadata-tool user-metadata --overwrite
 ```
 
 The Excel file is read from:
+
 ```
 NatureScan_drone / user_metadata.xlsx
 ```
